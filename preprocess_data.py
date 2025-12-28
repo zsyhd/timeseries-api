@@ -170,8 +170,58 @@ def preprocess_data(input_file='MData.json', output_file='MData_Cleaned.json'):
     # حذف تکراری‌ها
     df = df.loc[:, ~df.columns.duplicated()]
 
-    # 8. تبدیل timestamp به string
-    df['timestamp'] = df['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
+    # =====================================================================
+    # 7.5 پاک‌سازی زمان‌بندی: حذف رکوردهای ثانیه‌ای، حذف زمان‌های تکراری و
+    #      پر کردن فاصله‌های خالی با فرکانس دقیقه‌ای ثابت
+    # این مرحله اطمینان می‌دهد که خروجی بدون ثانیه اضافی و با فواصل زمانی
+    # یک‌دقیقه‌ای یکنواخت باشد. همچنین زمان‌های تکراری (timestamp یکسان)
+    # حذف می‌شود و مقادیر سنسورها در زمان‌های جدید با درون‌یابی خطی پر
+    # می‌گردد و شناسه چاه و کلاس با روش forward/backward پر می‌شود.
+    print("\n🧹 پاک‌سازی زمان‌بندی...")
+    # تبدیل timestamp به datetime برای پردازش
+    df['timestamp_dt'] = pd.to_datetime(df['timestamp'])
+    # حذف رکوردهایی که ثانیه آن‌ها صفر نیست (ثانیه‌ای بودن)
+    before_seconds = len(df)
+    df = df[df['timestamp_dt'].dt.second == 0].copy()
+    removed_seconds = before_seconds - len(df)
+    if removed_seconds > 0:
+        print(f"   ✓ {removed_seconds} رکورد با ثانیه غیر صفر حذف شد")
+    else:
+        print("   ✓ رکورد ثانیه‌ای یافت نشد")
+    # حذف زمان‌های تکراری (keep first)
+    before_dup = len(df)
+    df = df.drop_duplicates(subset=['timestamp_dt'], keep='first')
+    removed_dups = before_dup - len(df)
+    if removed_dups > 0:
+        print(f"   ✓ {removed_dups} رکورد زمان تکراری حذف شد")
+    else:
+        print("   ✓ زمان تکراری یافت نشد")
+    # پر کردن فواصل خالی
+    # دامنه زمانی کامل بین اولین و آخرین زمان موجود با دقت 1 دقیقه
+    start = df['timestamp_dt'].min()
+    end = df['timestamp_dt'].max()
+    full_range = pd.date_range(start=start, end=end, freq='1min')
+    # Reindex بر اساس timestamp_dt
+    df = df.set_index('timestamp_dt').reindex(full_range)
+    # پس از reindex، index همان timestamp جدید است
+    df['timestamp_dt'] = df.index
+    # پر کردن کلاس و well_id با forward/backward fill
+    if 'class' in df.columns:
+        df['class'] = df['class'].ffill().bfill()
+    if 'well_id' in df.columns:
+        df['well_id'] = df['well_id'].ffill().bfill()
+    # درون‌یابی خطی برای سنسورها
+    for col in sensor_cols:
+        if col in ['timestamp', 'original_timestamp', '_old_timestamp']:
+            continue
+        # فقط برای ستون‌های عددی اعمال شود
+        if col in df.columns:
+            df[col] = df[col].interpolate(method='linear', limit_direction='both')
+    # ریست index
+    df = df.reset_index(drop=True)
+    # تبدیل timestamp به string
+    df['timestamp'] = df['timestamp_dt'].dt.strftime('%Y-%m-%d %H:%M:%S')
+    df = df.drop(columns=['timestamp_dt'])
 
     # 9. ذخیره
     print("\n💾 ذخیره فایل...")
