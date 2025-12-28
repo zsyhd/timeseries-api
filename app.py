@@ -1,199 +1,138 @@
 from fastapi import FastAPI, Query
-from typing import Optional
+from typing import Any, Dict, List, Optional, Tuple
 import json
 import os
-import re  # اضافه کردن کتابخانه Regex برای شکار کردن اعداد
-from datetime import datetime, timedelta
+from datetime import datetime
 from collections import defaultdict
 
-app = FastAPI(title="Well Time Series API - Regex Powered")
 
-# --------------------------------------------------
-# 1. بارگذاری ایمن داده‌ها
-# --------------------------------------------------
-def load_data():
+app = FastAPI(title="Well Time Series API (CleanedData.json)")
+
+
+def load_cleaned_data() -> List[Dict[str, Any]]:
     base_dir = os.path.dirname(os.path.realpath(__file__))
-    json_path = os.path.join(base_dir, "MData.json")
-
-    if not os.path.exists(json_path):
+    path = os.path.join(base_dir, "CleanedData.json")
+    if not os.path.exists(path):
         return []
-
     try:
-        with open(json_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
     except Exception:
         return []
 
-def normalize_key(key: str) -> str:
-    return key.lower().replace("-", "_")
 
-# --------------------------------------------------
-# 2. موتور تبدیل تاریخ (Regex Engine)
-# --------------------------------------------------
-def parse_smart_timestamp(raw_ts: str) -> Optional[datetime]:
-    """
-    این تابع هر مدلی از نوشتن روز را می‌فهمد.
-    مثال‌هایی که الان کار می‌کنند:
-    - "day1 12:00"
-    - "Day 2 12:00" (با فاصله)
-    - "day-3 12:00"
-    """
-    if not raw_ts or not isinstance(raw_ts, str):
-        return None
-    
-    # تاریخ مبدا (اول سال ۲۰۲۴)
-    BASE_DATE = datetime(2024, 1, 1)
-    
-    clean_ts = raw_ts.strip()
-
+def parse_iso_dt(s: str) -> Optional[datetime]:
     try:
-        # --- استراتژی ۱: پیدا کردن الگوی "day X" با Regex ---
-        # این الگو میگه: کلمه day باشه، شاید فاصله باشه، بعدش عدد باشه
-        day_match = re.search(r'day\s*[-_]?\s*(\d+)', clean_ts, re.IGNORECASE)
-        
-        if day_match:
-            # عدد روز را استخراج کن (مثلاً 2)
-            day_num = int(day_match.group(1))
-            
-            # حالا سعی کن ساعت را پیدا کنی
-            # هر چیزی که بعد از الگوی day+عدد مانده باشد، ساعته
-            time_part = clean_ts[day_match.end():].strip()
-            
-            # اگر ساعت خالی بود، پیش‌فرض 00:00:00
-            t = datetime.min.time() 
-            
-            if time_part:
-                # تلاش برای خواندن فرمت‌های مختلف ساعت
-                for fmt in ["%I:%M:%S %p", "%H:%M:%S", "%H:%M", "%I:%M %p"]:
-                    try:
-                        t = datetime.strptime(time_part, fmt).time()
-                        break
-                    except:
-                        pass
-            
-            # محاسبه تاریخ نهایی: مبدا + (تعداد روز - ۱)
-            final_dt = BASE_DATE + timedelta(days=day_num - 1)
-            return datetime.combine(final_dt.date(), t)
-
-        # --- استراتژی ۲: فقط ساعت (مثل 00:02:00) ---
-        # اگر کلمه day نبود ولی : داشتیم
-        if ":" in clean_ts and len(clean_ts) < 15:
-             # تلاش برای پارس کردن ساعت
-             for fmt in ["%H:%M:%S", "%H:%M"]:
-                 try:
-                     t = datetime.strptime(clean_ts, fmt).time()
-                     return datetime.combine(BASE_DATE.date(), t)
-                 except:
-                     pass
-
-        # --- استراتژی ۳: فرمت استاندارد ایزو ---
-        if "T" in clean_ts:
-             return datetime.fromisoformat(clean_ts)
-
+        return datetime.fromisoformat(s)
     except Exception:
         return None
 
+
+def bucket_key(dt: datetime, granularity: str) -> str:
+    g = granularity.lower()
+    if g == "minute":
+        return dt.strftime("%Y-%m-%d %H:%M")
+    if g == "hour":
+        return dt.strftime("%Y-%m-%d %H:00")
+    # default day
+    return dt.strftime("%Y-%m-%d")
+
+
+def safe_float(x: Any) -> Optional[float]:
+    if isinstance(x, (int, float)):
+        return float(x)
     return None
 
-# --------------------------------------------------
-# 3. روت‌ها
-# --------------------------------------------------
+
 @app.get("/")
-def read_root():
-    return {"status": "Running", "message": "Use /api/well/timeseries?well_id=1"}
+def root():
+    return {
+        "status": "Running",
+        "hint": "First run cleaner.py to generate CleanedData.json, then call /api/well/timeseries"
+    }
+
 
 @app.get("/api/well/timeseries")
 def get_timeseries(
     well_id: int = Query(..., description="Well ID"),
-    start_date: Optional[str] = Query(None),
-    event_id: Optional[int] = Query(None),
-    granularity: str = Query("day")
+    start_date: Optional[str] = Query(None, description="YYYY-MM-DD (inclusive)"),
+    end_date: Optional[str] = Query(None, description="YYYY-MM-DD (inclusive)"),
+    event_id: Optional[int] = Query(None, description="Filter by class/event id"),
+    granularity: str = Query("day", description="minute | hour | day"),
+    limit: Optional[int] = Query(None, description="Return last N buckets (after sorting)"),
 ):
-    data = load_data()
+    data = load_cleaned_data()
     if not data:
-        return {"error": "No data available"}
+        return {"error": "CleanedData.json not found or empty. Run cleaner.py first."}
 
-    # --- فیلتر و پردازش ---
-    filtered = []
-    
-    # شمارنده برای دیباگ (که اگر صفر شد بفهمیم)
-    debug_parsed_count = 0 
-    
+    g = granularity.lower()
+    if g not in ("minute", "hour", "day"):
+        return {"error": "Invalid granularity. Use minute, hour, or day."}
+
+    sd = datetime.strptime(start_date, "%Y-%m-%d").date() if start_date else None
+    ed = datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else None
+
+    # 1) filter + parse dt
+    filtered: List[Tuple[datetime, Dict[str, Any]]] = []
     for row in data:
-        raw_ts = row.get("Timesteap") or row.get("timestamp") or row.get("Timestamp")
-        
-        # تبدیل تاریخ با موتور جدید Regex
-        dt = parse_smart_timestamp(raw_ts)
-        
-        if not dt:
+        if int(row.get("well_id", -1)) != well_id:
             continue
-            
-        debug_parsed_count += 1
 
-        # فیلتر تاریخ شروع
-        if start_date:
-            try:
-                if dt.date() < datetime.strptime(start_date, "%Y-%m-%d").date():
-                    continue
-            except:
-                pass
-
-        # فیلتر کلاس
         if event_id is not None:
             try:
-                if int(row.get("class", -1)) != int(event_id):
+                if int(row.get("class", -999)) != int(event_id):
                     continue
-            except:
-                pass
+            except Exception:
+                continue
 
-        row["_clean_date"] = dt.date().isoformat()
-        filtered.append(row)
+        dt = parse_iso_dt(row.get("timestamp", ""))
+        if not dt:
+            continue
 
-    # --- اگر هیچ دیتایی پارس نشد ---
-    if debug_parsed_count == 0:
-        return {"error": "Could not parse any dates. Check date format in MData.json"}
+        if sd and dt.date() < sd:
+            continue
+        if ed and dt.date() > ed:
+            continue
 
-    # --- تجمیع روزانه ---
-    daily_bucket = defaultdict(list)
-    for row in filtered:
-        daily_bucket[row["_clean_date"]].append(row)
+        filtered.append((dt, row))
 
-    # --- محاسبه میانگین ---
-    points = []
-    for day, rows in daily_bucket.items():
-        values_map = defaultdict(list)
+    if not filtered:
+        return {"well_id": well_id, "granularity": g, "count": 0, "points": []}
+
+    # 2) bucket
+    buckets: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for dt, row in filtered:
+        k = bucket_key(dt, g)
+        buckets[k].append(row)
+
+    # 3) aggregate mean per numeric field
+    points: List[Dict[str, Any]] = []
+    for k, rows in buckets.items():
+        sums: Dict[str, float] = defaultdict(float)
+        counts: Dict[str, int] = defaultdict(int)
+
         for r in rows:
-            for k, v in r.items():
-                if k in ["Timesteap", "timestamp", "class", "well_id", "_clean_date"]:
+            for kk, vv in r.items():
+                if kk in ("timestamp", "well_id", "class"):
                     continue
-                
-                # تبدیل هوشمند اعداد (حتی اگر رشته باشند)
-                val = v
-                if isinstance(v, str):
-                    try:
-                        val = float(v)
-                    except:
-                        continue
-                
-                if isinstance(val, (int, float)):
-                    values_map[normalize_key(k)].append(val)
+                fv = safe_float(vv)
+                if fv is None:
+                    continue
+                sums[kk] += fv
+                counts[kk] += 1
 
-        aggregated = {
-            k: round(sum(v) / len(v), 2)
-            for k, v in values_map.items() if v
-        }
+        agg = {kk: round(sums[kk] / counts[kk], 4) for kk in sums.keys() if counts[kk] > 0}
+        points.append({"name": k, "value": agg})
 
-        points.append({"name": day, "value": aggregated})
+    points.sort(key=lambda x: x["name"])
 
-    # مرتب‌سازی و خروجی
-    points_sorted = sorted(points, key=lambda x: x["name"])
-    
-    # نکته: اگر می‌خواهی "همه" روزها را ببینی، عدد ۶۰ را بردار
-    final_points = points_sorted # [-60:] را برداشتم تا همه را ببینی
+    if limit is not None and limit > 0:
+        points = points[-limit:]
 
     return {
         "well_id": well_id,
-        "granularity": granularity,
-        "count": len(final_points),
-        "points": final_points
+        "granularity": g,
+        "count": len(points),
+        "points": points,
     }
