@@ -2,71 +2,94 @@ import json
 import re
 from datetime import datetime, timedelta
 
-INPUT_FILE = "MData.json"
-OUTPUT_FILE = "CleanedData.json"
-BASE_DATE = datetime(2024, 1, 1)
-RECORDS_PER_DAY = 1440
+# تنظیمات پایه (فرض می‌کنیم شروع داده‌ها از اول سال ۲۰۲۴ است)
+BASE_YEAR = 2024
+BASE_MONTH = 1
+BASE_DAY = 1
 
-def parse_timestamp(raw_ts, index):
-    if raw_ts is None:
+def clean_time(raw_time):
+    """
+    این تابع زمان‌های عجیب و غریب را به فرمت استاندارد ISO تبدیل می‌کند.
+    مثل: '2024-01-01T12:01:00'
+    """
+    if not raw_time or not isinstance(raw_time, str):
         return None
-    
-    # بخش ۱: پشتیبانی از اعداد (Timestamp اکسل)
-    if isinstance(raw_ts, (int, float)):
-        try:
-            ts_val = raw_ts
-            # تبدیل میلیثانیه به ثانیه
-            if abs(ts_val) > 20000000000:
-                ts_val = ts_val / 1000
-            dt = datetime.fromtimestamp(ts_val)
-            # حل مشکل سال ۱۹۰۰
-            if dt.year < 2000:
-                dt = dt.replace(year=2024, month=1, day=1) + timedelta(days=(dt.day - 1))
-            return dt
-        except:
-            pass
-    
-    # تبدیل به رشته برای حالتهای متنی
-    raw_str = str(raw_ts).strip()
-    
-    # حالت ۱: dayX (مثلاً "day 5 14:30:45")
-    day_match = re.search(r'day\s*[-_]?\s*(\d+)', raw_str, re.IGNORECASE)
-    if day_match:
-        day_num = int(day_match.group(1))
-        time_part = raw_str[day_match.end():].strip()
-        t = datetime.min.time()
-        
-        for fmt in ["%I:%M:%S %p", "%H:%M:%S", "%H:%M"]:
-            try:
-                t = datetime.strptime(time_part, fmt).time()
-                break
-            except:
-                pass
-        
-        return datetime.combine(
-            (BASE_DATE + timedelta(days=day_num - 1)).date(),
-            t
-        )
-    
-    # حالت ۲: فقط ساعت (مثلاً "14:30:45")
-    if ":" in raw_str:
-        day_num = index // RECORDS_PER_DAY
-        try:
-            t = datetime.strptime(raw_str, "%H:%M:%S").time()
-        except:
-            try:
-                t = datetime.strptime(raw_str, "%H:%M").time()
-            except:
-                return None
-        
-        return datetime.combine(
-            (BASE_DATE + timedelta(days=day_num)).date(),
-            t
-        )
-    
-    return None
 
-# اجرای عملیات
-print("🔄 Running cleaner...")
-try:
-    with open(INPUT_FI
+    # حذف فاصله‌های اضافی
+    raw_time = raw_time.strip()
+
+    # مدل ۱: "day1 12:01:00 AM"
+    # استخراج روز و ساعت
+    day_match = re.search(r'day(\d+)', raw_time, re.IGNORECASE)
+    day_offset = int(day_match.group(1)) - 1 if day_match else 0
+
+    # پیدا کردن ساعت
+    # مدل ساعت خالی: "00:02:00"
+    # مدل ساعت با AM/PM: "12:01:00 AM"
+    
+    time_str = raw_time
+    if "day" in raw_time:
+        parts = raw_time.split(' ', 1)
+        if len(parts) > 1:
+            time_str = parts[1]
+    
+    try:
+        # تلاش برای پارس کردن ساعت
+        if "M" in time_str.upper(): # مثل AM یا PM
+            t = datetime.strptime(time_str.strip(), "%I:%M:%S %p")
+        else:
+            t = datetime.strptime(time_str.strip(), "%H:%M:%S")
+            
+        # ساخت تاریخ نهایی
+        final_date = datetime(BASE_YEAR, BASE_MONTH, BASE_DAY) + timedelta(days=day_offset)
+        final_date = final_date.replace(hour=t.hour, minute=t.minute, second=t.second)
+        
+        return final_date.isoformat() # فرمت استاندارد: YYYY-MM-DDTHH:MM:SS
+        
+    except Exception as e:
+        print(f"Skipping invalid time: {raw_time}")
+        return None
+
+def main():
+    try:
+        with open("MData.json", "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        print("MData.json not found!")
+        return
+
+    cleaned_data = []
+    
+    for row in data:
+        # ۱. اصلاح نام فیلد (Timesteap -> timestamp)
+        raw_ts = row.get("Timesteap") or row.get("Timestamp") or row.get("timestamp")
+        
+        standard_ts = clean_time(raw_ts)
+        
+        if standard_ts:
+            new_row = {
+                "timestamp": standard_ts,     # نام درست + فرمت درست
+                "well_id": row.get("well_id", 1), # اگر نداشت پیش‌فرض ۱ بذار
+                "class": row.get("class", 0)      # اگر نداشت پیش‌فرض ۰ (نرمال)
+            }
+            
+            # کپی کردن بقیه ستون‌های عددی (فشار، دما و...)
+            for k, v in row.items():
+                if k not in ["Timesteap", "Timestamp", "timestamp", "class", "well_id"]:
+                    # فقط اعداد را نگه دار
+                    try:
+                        float(v)
+                        new_row[k.lower().replace("-", "_")] = v # استاندارد سازی نام ستون‌ها
+                    except:
+                        pass
+            
+            cleaned_data.append(new_row)
+
+    # ذخیره فایل جدید
+    with open("CleanedData.json", "w", encoding="utf-8") as f:
+        json.dump(cleaned_data, f, indent=2)
+    
+    print(f"Success! Converted {len(data)} rows to {len(cleaned_data)} clean rows in 'CleanedData.json'.")
+
+if __name__ == "__main__":
+    main()
