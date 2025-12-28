@@ -1,138 +1,64 @@
 from fastapi import FastAPI, Query
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Optional
 import json
 import os
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 from collections import defaultdict
 
+app = FastAPI(title="Well Time Series API")
 
-app = FastAPI(title="Well Time Series API (CleanedData.json)")
-
-
-def load_cleaned_data() -> List[Dict[str, Any]]:
+# --------------------------------------------------
+# 1. بارگذاری ایمن داده‌ها
+# --------------------------------------------------
+def load_data():
+    """بارگذاری داده از فایل JSON"""
     base_dir = os.path.dirname(os.path.realpath(__file__))
-    path = os.path.join(base_dir, "CleanedData.json")
-    if not os.path.exists(path):
-        return []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, list) else []
-    except Exception:
+    json_path = os.path.join(base_dir, "MData.json")
+
+    if not os.path.exists(json_path):
         return []
 
-
-def parse_iso_dt(s: str) -> Optional[datetime]:
     try:
-        return datetime.fromisoformat(s)
-    except Exception:
+        with open(json_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Error loading data: {e}")
+        return []
+
+def normalize_key(key: str) -> str:
+    """تبدیل نام کلیدها به فرمت استاندارد"""
+    return key.lower().replace("-", "_")
+
+# --------------------------------------------------
+# 2. موتور تبدیل تاریخ با Regex
+# --------------------------------------------------
+def parse_smart_timestamp(raw_ts: str) -> Optional[datetime]:
+    """
+    تبدیل فرمت‌های مختلف تاریخ به datetime
+    مثال: "day1 12:01:00 AM", "00:02:00", "day 2 12:00"
+    """
+    if not raw_ts or not isinstance(raw_ts, str):
         return None
 
+    BASE_DATE = datetime(2024, 1, 1)
+    clean_ts = raw_ts.strip()
 
-def bucket_key(dt: datetime, granularity: str) -> str:
-    g = granularity.lower()
-    if g == "minute":
-        return dt.strftime("%Y-%m-%d %H:%M")
-    if g == "hour":
-        return dt.strftime("%Y-%m-%d %H:00")
-    # default day
-    return dt.strftime("%Y-%m-%d")
+    try:
+        # استراتژی 1: الگوی "day X" با Regex
+        day_match = re.search(r'day\s*[-_]?\s*(\d+)', clean_ts, re.IGNORECASE)
 
+        if day_match:
+            day_num = int(day_match.group(1))
+            time_part = clean_ts[day_match.end():].strip()
 
-def safe_float(x: Any) -> Optional[float]:
-    if isinstance(x, (int, float)):
-        return float(x)
-    return None
+            t = datetime.min.time()
+            if time_part:
+                for fmt in ["%I:%M:%S %p", "%H:%M:%S", "%H:%M", "%I:%M %p"]:
+                    try:
+                        t = datetime.strptime(time_part, fmt).time()
+                        break
+                    except ValueError:
+                        continue
 
-
-@app.get("/")
-def root():
-    return {
-        "status": "Running",
-        "hint": "First run cleaner.py to generate CleanedData.json, then call /api/well/timeseries"
-    }
-
-
-@app.get("/api/well/timeseries")
-def get_timeseries(
-    well_id: int = Query(..., description="Well ID"),
-    start_date: Optional[str] = Query(None, description="YYYY-MM-DD (inclusive)"),
-    end_date: Optional[str] = Query(None, description="YYYY-MM-DD (inclusive)"),
-    event_id: Optional[int] = Query(None, description="Filter by class/event id"),
-    granularity: str = Query("day", description="minute | hour | day"),
-    limit: Optional[int] = Query(None, description="Return last N buckets (after sorting)"),
-):
-    data = load_cleaned_data()
-    if not data:
-        return {"error": "CleanedData.json not found or empty. Run cleaner.py first."}
-
-    g = granularity.lower()
-    if g not in ("minute", "hour", "day"):
-        return {"error": "Invalid granularity. Use minute, hour, or day."}
-
-    sd = datetime.strptime(start_date, "%Y-%m-%d").date() if start_date else None
-    ed = datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else None
-
-    # 1) filter + parse dt
-    filtered: List[Tuple[datetime, Dict[str, Any]]] = []
-    for row in data:
-        if int(row.get("well_id", -1)) != well_id:
-            continue
-
-        if event_id is not None:
-            try:
-                if int(row.get("class", -999)) != int(event_id):
-                    continue
-            except Exception:
-                continue
-
-        dt = parse_iso_dt(row.get("timestamp", ""))
-        if not dt:
-            continue
-
-        if sd and dt.date() < sd:
-            continue
-        if ed and dt.date() > ed:
-            continue
-
-        filtered.append((dt, row))
-
-    if not filtered:
-        return {"well_id": well_id, "granularity": g, "count": 0, "points": []}
-
-    # 2) bucket
-    buckets: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for dt, row in filtered:
-        k = bucket_key(dt, g)
-        buckets[k].append(row)
-
-    # 3) aggregate mean per numeric field
-    points: List[Dict[str, Any]] = []
-    for k, rows in buckets.items():
-        sums: Dict[str, float] = defaultdict(float)
-        counts: Dict[str, int] = defaultdict(int)
-
-        for r in rows:
-            for kk, vv in r.items():
-                if kk in ("timestamp", "well_id", "class"):
-                    continue
-                fv = safe_float(vv)
-                if fv is None:
-                    continue
-                sums[kk] += fv
-                counts[kk] += 1
-
-        agg = {kk: round(sums[kk] / counts[kk], 4) for kk in sums.keys() if counts[kk] > 0}
-        points.append({"name": k, "value": agg})
-
-    points.sort(key=lambda x: x["name"])
-
-    if limit is not None and limit > 0:
-        points = points[-limit:]
-
-    return {
-        "well_id": well_id,
-        "granularity": g,
-        "count": len(points),
-        "points": points,
-    }
+            final_dt = BASE_DATE + timedelta(days=day_num - 1)
