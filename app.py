@@ -3,71 +3,68 @@ from typing import Optional
 import json
 import os
 from collections import defaultdict
+from datetime import datetime
 
 app = FastAPI(title="Well Time Series API")
 
 def load_data():
+    """بارگذاری داده‌های تمیز‌شده"""
     base_dir = os.path.dirname(os.path.realpath(__file__))
     json_path = os.path.join(base_dir, "CleanedData.json")
+    
     if not os.path.exists(json_path):
         return []
-    with open(json_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Error loading data: {e}")
+        return []
 
 @app.get("/")
 def root():
-    return {"status": "OK"}
+    """بررسی سلامت API"""
+    return {"status": "OK", "message": "Well Time Series API"}
 
 @app.get("/api/well/timeseries")
 def get_timeseries(
-    well_id: int = Query(...),
-    start_date: Optional[str] = Query(None),
-    event_id: Optional[int] = Query(None),
-    granularity: str = Query("day")
+    well_id: int = Query(..., description="Well ID"),
+    start_date: Optional[str] = Query(None, description="YYYY-MM-DD format"),
+    event_id: Optional[int] = Query(None, description="Event/Class ID"),
+    granularity: str = Query("day", description="Aggregation level: day, week, month")
 ):
-    data = load_data()
-    if not data:
-        return {"error": "No data"}
-
-    daily_bucket = defaultdict(list)
-
-    for row in data:
-        if row.get("well_id") != well_id:
-            continue
-
-        if event_id is not None and row.get("class") != event_id:
-            continue
-
-        ts = row["timestamp"]
-        day = ts.split("T")[0]
-
-        if start_date and day < start_date:
-            continue
-
-        daily_bucket[day].append(row)
-
-    points = []
-
-    for day, rows in daily_bucket.items():
-        sums = defaultdict(float)
-        counts = defaultdict(int)
-
-        for r in rows:
-            for k, v in r.items():
-                if k in ["timestamp", "class", "well_id"]:
+    """
+    دریافت سری زمانی برای یک چاه
+    
+    Parameters:
+    - well_id: شناسه چاه (الزامی)
+    - start_date: تاریخ شروع (اختیاری)
+    - event_id: شناسه رویداد (اختیاری)
+    - granularity: سطح تجمیع (روزی، هفتگی، ماهانه)
+    """
+    try:
+        data = load_data()
+        
+        if not data:
+            return {
+                "error": "No data available",
+                "well_id": well_id,
+                "count": 0,
+                "points": []
+            }
+        
+        daily_bucket = defaultdict(list)
+        
+        # فیلتر کردن داده‌ها
+        for row in data:
+            if row.get("well_id") != well_id:
+                continue
+            
+            if event_id is not None and row.get("class") != event_id:
+                continue
+            
+            try:
+                ts = row.get("timestamp", "")
+                if not ts:
                     continue
-                if isinstance(v, (int, float)):
-                    sums[k] += v
-                    counts[k] += 1
-
-        avg = {k: round(sums[k] / counts[k], 2) for k in sums}
-        points.append({"name": day, "value": avg})
-
-    points.sort(key=lambda x: x["name"])
-
-    return {
-        "well_id": well_id,
-        "granularity": granularity,
-        "count": len(points),
-        "points": points
-    }
