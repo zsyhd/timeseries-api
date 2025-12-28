@@ -3,6 +3,22 @@ from fastapi.responses import JSONResponse
 from typing import Optional, List
 import json
 import os
+# در ابتدای فایل بعد از imports
+_cached_data = None
+
+def load_data():
+    global _cached_data
+    if _cached_data is not None:
+        return _cached_data  # بارگذاری فقط یکبار!
+    
+    # مسیر یک پوشه بالاتر (چون در api/ هستیم)
+    base_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    json_path = os.path.join(base_dir, "MData_Cleaned.json")
+    
+    with open(json_path, "r", encoding="utf-8") as f:
+        _cached_data = json.load(f)
+    return _cached_data
+
 from datetime import datetime, timedelta
 from collections import defaultdict
 
@@ -218,3 +234,6 @@ if __name__ == "__main__":
     print("=" * 70)
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
+# برای Vercel
+handler = app
+
