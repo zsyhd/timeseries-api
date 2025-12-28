@@ -1,91 +1,70 @@
-from fastapi import FastAPI, Query
-from typing import Optional
 import json
-import os
-from datetime import datetime
-from collections import defaultdict
+import re
+from datetime import datetime, timedelta
 
-app = FastAPI(title="Well Time Series API")
+INPUT_FILE = "MData.json"
+OUTPUT_FILE = "CleanedData.json"
 
-# --- بارگذاری دیتای تمیز ---
-def load_data():
-    base_dir = os.path.dirname(os.path.realpath(__file__))
-    # توجه: داریم فایل تمیز شده را می‌خوانیم
-    json_path = os.path.join(base_dir, "CleanedData.json")
-    
-    if not os.path.exists(json_path):
-        return []
-    
-    with open(json_path, "r", encoding='utf-8') as f:
-        return json.load(f)
+BASE_DATE = datetime(2024, 1, 1)
+RECORDS_PER_DAY = 1440  # هر ۱۴۴۰ رکورد = یک روز
 
-@app.get("/")
-def read_root():
-    return {"status": "Running", "message": "Go to /api/well/timeseries?well_id=1"}
+def parse_timestamp(raw_ts, index):
+    if not raw_ts:
+        return None
 
-@app.get("/api/well/timeseries")
-def get_timeseries(
-    well_id: int = Query(..., description="Well ID"),
-    start_date: Optional[str] = Query(None),
-    event_id: Optional[int] = Query(None),
-    granularity: str = Query("day")
-):
-    data = load_data()
-    
-    if not data:
-        return {"error": "CleanedData.json is missing or empty"}
+    raw_ts = str(raw_ts).strip()
 
-    points = []
-    
-    # چون دیتا تمیز است، پردازش خیلی ساده می‌شود
-    daily_bucket = defaultdict(list)
+    # --- حالت ۱: dayX داریم ---
+    day_match = re.search(r'day\s*[-_]?\s*(\d+)', raw_ts, re.IGNORECASE)
+    if day_match:
+        day_num = int(day_match.group(1))
+        time_part = raw_ts[day_match.end():].strip()
 
-    for row in data:
-        # فیلتر Well ID
-        if row.get("well_id") != well_id:
-            continue
+        t = datetime.min.time()
+        for fmt in ["%I:%M:%S %p", "%H:%M:%S", "%H:%M"]:
+            try:
+                t = datetime.strptime(time_part, fmt).time()
+                break
+            except:
+                pass
 
-        # فیلتر Event ID
-        if event_id is not None and row.get("class") != event_id:
-            continue
+        return datetime.combine(
+            (BASE_DATE + timedelta(days=day_num - 1)).date(),
+            t
+        )
 
-        # پردازش تاریخ (چون فرمت ISO است، ۱۰ کاراکتر اول همیشه تاریخ است)
-        # مثال: "2024-01-01T12:00:00" -> "2024-01-01"
-        ts_full = row["timestamp"]
-        date_str = ts_full.split("T")[0]
+    # --- حالت ۲: فقط ساعت داریم ---
+    if ":" in raw_ts:
+        day_num = index // RECORDS_PER_DAY
+        try:
+            t = datetime.strptime(raw_ts, "%H:%M:%S").time()
+        except:
+            t = datetime.strptime(raw_ts, "%H:%M").time()
 
-        # فیلتر Start Date
-        if start_date and date_str < start_date:
-            continue
-            
-        daily_bucket[date_str].append(row)
+        return datetime.combine(
+            (BASE_DATE + timedelta(days=day_num)).date(),
+            t
+        )
 
-    # میانگین‌گیری روزانه
-    for day, rows in daily_bucket.items():
-        if not rows: continue
-        
-        # جمع‌آوری مقادیر عددی برای میانگین
-        sums = defaultdict(float)
-        counts = defaultdict(int)
-        
-        for r in rows:
-            for k, v in r.items():
-                if k not in ["timestamp", "class", "well_id"] and isinstance(v, (int, float)):
-                    sums[k] += v
-                    counts[k] += 1
-        
-        avg_values = {k: round(sums[k]/counts[k], 2) for k in sums}
-        
-        points.append({
-            "name": day,
-            "value": avg_values
-        })
+    return None
 
-    # سورت کردن بر اساس تاریخ
-    points.sort(key=lambda x: x["name"])
 
-    return {
-        "well_id": well_id,
-        "count": len(points),
-        "points": points[-60:] # ۶۰ روز آخر
-    }
+with open(INPUT_FILE, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+cleaned = []
+
+for idx, row in enumerate(data):
+    raw_ts = row.get("Timesteap") or row.get("timestamp")
+
+    dt = parse_timestamp(raw_ts, idx)
+    if not dt:
+        continue
+
+    row["timestamp"] = dt.isoformat()
+    cleaned.append(row)
+
+with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+    json.dump(cleaned, f, ensure_ascii=False, indent=2)
+
+print(f"✅ Cleaned {len(cleaned)} records into {OUTPUT_FILE}")
